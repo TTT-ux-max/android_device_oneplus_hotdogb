@@ -1,0 +1,234 @@
+name: Build LineageOS
+
+# 手动触发，避免每次 push 都跑满 6 小时额度
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "LineageOS 源码分支"
+        type: choice
+        required: true
+        default: lineage-18.1
+        options:
+          - lineage-18.1
+          - lineage-19.1
+          - lineage-20
+          - lineage-21
+      device:
+        description: "设备代号"
+        type: string
+        required: true
+        default: hotdogb
+      lunch_target:
+        description: "lunch 目标（18.1 为 lineage_hotdogb-userdebug）"
+        type: string
+        required: true
+        default: lineage_hotdogb-userdebug
+      vendor_repo:
+        description: "vendor blobs 仓库"
+        type: string
+        required: true
+        default: https://github.com/TheMuppets/proprietary_vendor_oneplus
+      vendor_branch:
+        description: "vendor 仓库分支（TheMuppets 官方只维护到 lineage-19.1）"
+        type: string
+        required: true
+        default: lineage-18.1
+      make_jobs:
+        description: "并行任务数，0 = 自动取 nproc"
+        type: string
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lineage-${{ github.ref }}-${{ inputs.device }}
+  cancel-in-progress: true
+
+env:
+  BRANCH: ${{ inputs.branch }}
+  DEVICE: ${{ inputs.device }}
+  LUNCH_TARGET: ${{ inputs.lunch_target }}
+  VENDOR_REPO: ${{ inputs.vendor_repo }}
+  VENDOR_BRANCH: ${{ inputs.vendor_branch }}
+  MAKE_JOBS: ${{ inputs.make_jobs }}
+  SRC_DIR: ${{ github.workspace }}/android
+  USE_CCACHE: "1"
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: "5G"
+  CCACHE_COMPRESS: "1"
+
+jobs:
+  build:
+    name: ${{ inputs.branch }} / ${{ inputs.device }}
+    # ubuntu-20.04 已被 GitHub 下线，只能用 22.04；老 AOSP 的兼容处理见 README
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    steps:
+      - name: Check runner
+        run: |
+          echo "CPU: $(nproc) cores | RAM: $(free -g | awk '/Mem:/{print $2}') GB"
+          df -h /
+
+      # GitHub 托管的运行器初始只剩约 14GB，而 LineageOS 全量源码 + out 目录要 45GB 以上。
+      # 删掉 runner 预装的大型工具链来腾空间，这是社区通行做法。
+      - name: Free disk space
+        run: |
+          set -x
+          sudo swapoff -a || true
+          sudo rm -rf /swapfile /mnt/swapfile || true
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android/sdk
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          sudo rm -rf /usr/share/az_1* /usr/local/aws-cli /usr/local/aws-sam-cli
+          docker image prune -af || true
+          sudo apt-get clean
+          df -h /
+
+      # 22.04 上部分 2020 年的包名已不存在（lib32ncurses5-dev、openjdk-9-jdk、
+      # libwxgtk3.0-dev 等）。逐个安装并容错，缺一个不致命。
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq || true
+          PKGS="
+            bc bison build-essential ccache curl flex g++ g++-multilib gcc gcc-multilib git gnupg gperf
+            imagemagick libc6-dev-i386 libelf-dev dwarves liblz4-tool lz4 libncurses-dev libncurses5
+            libncurses5-dev libsdl1.2-dev libssl-dev libtinfo5 libxml2 libxml2-utils
+            libwxgtk3.0-gtk3-dev libwxgtk3.1-gtk3-dev lzop m4 pngcrush python-is-python3 python3
+            rsync schedtool squashfs-tools unzip xz-utils xsltproc zip zlib1g-dev openjdk-11-jdk
+          "
+          SKIPPED=""
+          for p in $PKGS; do
+            sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 \
+              || SKIPPED="$SKIPPED $p"
+          done
+          echo "::notice::该 runner 上不存在的包:${SKIPPED:- 无}"
+          java -version
+          python3 --version
+          gcc --version | head -1
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.branch }}-${{ inputs.device }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.branch }}-${{ inputs.device }}-
+
+      - name: Set up repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "LineageOS CI"
+          git config --global color.ui false
+          repo --version
+
+      - name: Init and sync sources
+        run: |
+          set -o pipefail
+          mkdir -p "$SRC_DIR"
+          cd "$SRC_DIR"
+          # --depth=1 + -c 只拉当前分支的单层历史，把源码体积压到 25GB 上下
+          repo init -u https://github.com/LineageOS/android.git -b "$BRANCH" \
+            --depth=1 --no-repo-verify -q
+          repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags \
+            --no-repo-verify -q
+          df -h /
+
+      # 2020 年那篇教程要求手动 clone AOSiP 设备树并改 BoardConfig.mk 指向预编译内核；
+      # 现在官方树已覆盖 hotdogb，18.1 起直接由源码编内核，不需要那些手工修补
+      - name: Fetch device trees
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          rm -rf "device/oneplus/$DEVICE" device/oneplus/sm8150-common \
+                 hardware/oneplus kernel/oneplus/sm8150 vendor/oneplus
+          git clone --depth=1 -b "$BRANCH" \
+            "https://github.com/LineageOS/android_device_oneplus_${DEVICE}.git" \
+            "device/oneplus/$DEVICE"
+          git clone --depth=1 -b "$BRANCH" \
+            https://github.com/LineageOS/android_device_oneplus_sm8150-common.git \
+            device/oneplus/sm8150-common
+          git clone --depth=1 -b "$BRANCH" \
+            https://github.com/LineageOS/android_hardware_oneplus.git \
+            hardware/oneplus
+          git clone --depth=1 -b "$BRANCH" \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8150.git \
+            kernel/oneplus/sm8150
+          git clone --depth=1 -b "$VENDOR_BRANCH" "$VENDOR_REPO.git" vendor/oneplus || {
+            echo "::warning::vendor 分支 $VENDOR_BRANCH 拉取失败，先按无 blobs 继续，编译会在 vendor 阶段报错"
+            mkdir -p vendor/oneplus
+          }
+          du -sh device/oneplus/* vendor/oneplus kernel/oneplus/sm8150 hardware/oneplus
+
+      # AOSP 11 的部分预编译工具链仍动态链接 libtinfo.so.5 / libncurses.so.5，
+      # 而 22.04 只有 .so.6，缺了就报 "cannot open shared object file"。做个兼容软链兜底。
+      - name: Compatibility shims for Ubuntu 22.04
+        run: |
+          for lib in libtinfo libncurses; do
+            if ! ldconfig -p | grep -q "${lib}.so.5"; then
+              sudo ln -sf "/usr/lib/x86_64-linux-gnu/${lib}.so.6" \
+                          "/usr/lib/x86_64-linux-gnu/${lib}.so.5" || true
+            fi
+          done
+          ldconfig -p | grep -E 'libtinfo|libncurses' | head -6
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd "$SRC_DIR"
+          export LC_ALL=C
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8"
+          source build/envsetup.sh
+          lunch "$LUNCH_TARGET"
+          JOBS="$MAKE_JOBS"
+          [ "$JOBS" = "0" ] && JOBS="$(nproc)"
+          echo "::notice::开始编译，并行任务数 $JOBS"
+          date
+          mka bacon -j"$JOBS" 2>&1 | tee /tmp/build.log
+          date
+
+      - name: Report build tail on failure
+        if: failure()
+        run: |
+          echo "===== 构建日志末尾 ====="
+          tail -n 200 /tmp/build.log 2>/dev/null || echo "没有找到 /tmp/build.log"
+
+      - name: Upload flashable zip
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-${{ inputs.branch }}-${{ inputs.device }}-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            android/out/target/product/${{ inputs.device }}/*.zip
+            android/out/target/product/${{ inputs.device }}/*.img
+            android/out/target/product/${{ inputs.device }}/*.txt
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## LineageOS $BRANCH / $DEVICE"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 分支 | $BRANCH |"
+            echo "| lunch | $LUNCH_TARGET |"
+            echo "| vendor | $VENDOR_REPO ($VENDOR_BRANCH) |"
+            echo "| 运行器 | ubuntu-22.04 / $(nproc) 核 |"
+            echo ""
+            ls -lh "out/target/product/$DEVICE/"*.zip 2>/dev/null || echo "未产出 zip"
+          } >> "$GITHUB_STEP_SUMMARY"
+        working-directory: ${{ env.SRC_DIR }}
